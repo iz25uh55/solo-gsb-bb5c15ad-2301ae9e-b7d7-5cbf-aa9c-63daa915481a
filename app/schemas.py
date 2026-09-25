@@ -396,3 +396,66 @@ class RehearsalChunksPreviewOut(BaseModel):
     truncated_event_count: int
     chunks: list[RehearsalChunkOut]
     cuts: list[RehearsalCutOut]
+
+
+class PerformanceAuditIn(BaseModel):
+    """A performed take to audit against one voice of a saved measure.
+
+    ``hits`` holds the performed hit offsets as non-negative rational
+    strings (same format as durations, zero allowed); they must be
+    strictly increasing and lie in [0, target_duration), which is
+    checked against the stored measure. ``tolerance`` is a non-negative
+    rational string: a pair may be formed only when the absolute time
+    difference stays within it.
+    """
+
+    voice: str = Field(min_length=1, max_length=100, examples=["melody"])
+    hits: list[str] = Field(examples=[["0", "1/4", "3/4"]])
+    tolerance: str = Field(examples=["1/16"])
+
+    @field_validator("hits")
+    @classmethod
+    def hits_must_be_nonnegative_rationals(cls, value: list[str]) -> list[str]:
+        for item in value:
+            try:
+                parse_nonnegative_rational(item)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+        return value
+
+    @field_validator("tolerance")
+    @classmethod
+    def tolerance_must_be_nonnegative_rational(cls, value: str) -> str:
+        try:
+            parse_nonnegative_rational(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+
+class PerformancePairOut(BaseModel):
+    """One aligned expected/performed hit pair.
+
+    ``hit_index`` is the 0-based index into the request's hits list;
+    ``difference`` = hit offset - expected onset (signed, exact
+    fraction, its absolute value never exceeds the tolerance).
+    """
+
+    event_id: str
+    hit_index: int
+    difference: str
+
+
+class PerformanceAuditOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    voice: str
+    tolerance: str
+    # Aligned pairs in alignment order (both index sequences increase).
+    pairs: list[PerformancePairOut]
+    # Sound events left unpaired (missed onsets), in stored order.
+    missed: list[str]
+    # 0-based indices of performed hits left unpaired (extra hits).
+    extra: list[int]
+    # Sum of absolute paired differences (the secondary objective).
+    total_abs_difference: str

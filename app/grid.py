@@ -1464,3 +1464,123 @@ def rehearsal_chunks_preview(voices: list[dict], max_duration: Fraction) -> dict
         "cuts": cuts,
         "truncated_event_total": sum(cut_cost[index] for index in chosen),
     }
+
+
+# --- Performance audit: aligning expected onsets with performed hits --------
+
+
+def performance_audit(
+    voice: dict, hits: list[Fraction], tolerance: Fraction
+) -> dict:
+    """Align a voice's sound-event onsets with performed hit offsets.
+
+    ``voice`` is {"name": str, "events": [built events]}, ``hits`` a
+    strictly increasing list of exact Fraction offsets inside the
+    measure, and ``tolerance`` a non-negative Fraction. Every sound
+    event start is one expected hit; the performed hits are aligned to
+    the expected onsets one-to-one and in order (a pairing keeps both
+    sequences' order), and a pair is allowed only when its absolute time
+    difference is at most ``tolerance``.
+
+    Among all allowed pairings the result is chosen by:
+
+    1. the minimum total of missed onsets (sound events left unpaired)
+       and extra hits (performed hits left unpaired) — equivalently the
+       maximum number of pairs, since missed + extra = events + hits -
+       2 * pairs;
+    2. the minimum sum of absolute paired time differences;
+    3. the lexicographically smallest paired index sequence, comparing
+       the (event index, hit index) pairs in alignment order.
+
+    Returns {"pairs": [{"event", "hit_index", "difference"}],
+    "missed": [sound events], "extra": [hit indices],
+    "total_abs_difference": Fraction} with pairs in alignment order and
+    difference = hit - onset (a signed Fraction).
+
+    Optimization: a DP over (onset, hit) positions run backwards.
+    best[i][j] is (pairs, cost, first_pair) for optimally aligning
+    onsets[i:] with hits[j:]: the most pairs, then the smallest total
+    absolute difference, then the smallest first paired index pair. The
+    first pair decides the lexicographic order between two optimal
+    sequences, because sequences sharing their first pair share the
+    whole optimal tail behind it. Reconstruction walks forward, always
+    taking the pair when it is optimal (its index pair is smaller than
+    anything reachable after a skip) and otherwise moving to the skip
+    state whose stored optimum matches.
+    """
+    sounds = [event for event in voice["events"] if event["kind"] == KIND_SOUND]
+    onsets = [event["start"] for event in sounds]
+    event_count = len(sounds)
+    hit_count = len(hits)
+
+    # best[i][j] = (pairs, cost, first_pair); the borders (no onsets or
+    # no hits left) align nothing. first_pair is None exactly when the
+    # optimum has zero pairs (its cost is then zero too).
+    best: list[list[tuple[int, Fraction, tuple[int, int] | None]]] = [
+        [(0, Fraction(0), None)] * (hit_count + 1)
+        for _ in range(event_count + 1)
+    ]
+    for i in range(event_count - 1, -1, -1):
+        for j in range(hit_count - 1, -1, -1):
+            candidates = [best[i + 1][j], best[i][j + 1]]
+            difference = hits[j] - onsets[i]
+            if abs(difference) <= tolerance:
+                tail = best[i + 1][j + 1]
+                candidates.append(
+                    (tail[0] + 1, tail[1] + abs(difference), (i, j))
+                )
+            best[i][j] = min(
+                candidates,
+                key=lambda candidate: (
+                    -candidate[0],
+                    candidate[1],
+                    candidate[2] is None,
+                    candidate[2] if candidate[2] is not None else (),
+                ),
+            )
+
+    # Forward reconstruction: at each state, pairing is taken whenever
+    # it reaches the stored optimum; otherwise exactly one skip state
+    # reproduces the stored optimum (both may — the sequences are then
+    # identical — and either move is correct).
+    pair_rows: list[tuple[int, int, Fraction]] = []
+    i = j = 0
+    while i < event_count and j < hit_count and best[i][j][0] > 0:
+        target = best[i][j]
+        difference = hits[j] - onsets[i]
+        tail = best[i + 1][j + 1]
+        if (
+            abs(difference) <= tolerance
+            and tail[0] + 1 == target[0]
+            and tail[1] + abs(difference) == target[1]
+        ):
+            pair_rows.append((i, j, difference))
+            i += 1
+            j += 1
+        elif best[i + 1][j] == target:
+            i += 1
+        else:
+            assert best[i][j + 1] == target
+            j += 1
+
+    paired_events = {event_index for event_index, _, _ in pair_rows}
+    paired_hits = {hit_index for _, hit_index, _ in pair_rows}
+    return {
+        "pairs": [
+            {
+                "event": sounds[event_index],
+                "hit_index": hit_index,
+                "difference": difference,
+            }
+            for event_index, hit_index, difference in pair_rows
+        ],
+        "missed": [
+            event
+            for index, event in enumerate(sounds)
+            if index not in paired_events
+        ],
+        "extra": [
+            index for index in range(hit_count) if index not in paired_hits
+        ],
+        "total_abs_difference": best[0][0][1],
+    }

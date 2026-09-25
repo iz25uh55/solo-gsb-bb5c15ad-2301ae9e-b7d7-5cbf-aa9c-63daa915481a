@@ -72,6 +72,18 @@ cut, then the time-lexicographically earliest cut sequence. When no
 such partition exists (a boundary gap already exceeds the cap) the
 request is rejected with 422. It is a read-only preview; nothing is
 written back to SQLite.
+
+A performed take can finally be audited against one voice of a saved
+measure (POST /measures/{id}/performance-audit): the request names the
+voice, lists the performed hit offsets (non-negative rationals,
+strictly increasing, inside [0, target duration)) and a non-negative
+rational tolerance. Every sound event start of the voice is an
+expected hit; expected and performed hits are aligned one-to-one in
+order, pairing only when the absolute time difference stays within the
+tolerance. The alignment first minimizes missed plus extra hits, then
+the sum of absolute paired differences, then takes the
+lexicographically smallest paired index sequence. The result is
+read-only; nothing is written back to SQLite.
 """
 
 from __future__ import annotations
@@ -102,6 +114,7 @@ from .grid import (
     lead_handoff_preview,
     parse_nonnegative_rational,
     parse_rational,
+    performance_audit,
     practice_track_split,
     quantize_measure,
     rehearsal_chunks_preview,
@@ -117,6 +130,8 @@ from .schemas import (
     MeasureIn,
     MeasureOut,
     Mismatch,
+    PerformanceAuditIn,
+    PerformanceAuditOut,
     PracticeTracksOut,
     QuantizationPreviewIn,
     QuantizationPreviewOut,
@@ -160,6 +175,7 @@ def root() -> dict:
             "lead_handoff_preview": "POST /measures/{id}/lead-handoff-preview",
             "practice_tracks": "POST /measures/{id}/practice-tracks",
             "rehearsal_chunks_preview": "POST /measures/{id}/rehearsal-chunks-preview",
+            "performance_audit": "POST /measures/{id}/performance-audit",
         },
     }
 
@@ -690,4 +706,72 @@ def rehearsal_chunks_preview_route(
             }
             for cut in result["cuts"]
         ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/performance-audit",
+    response_model=PerformanceAuditOut,
+)
+def performance_audit_route(measure_id: int, payload: PerformanceAuditIn) -> dict:
+    # Read-only: the alignment is computed from the stored measure in
+    # exact fractions, but SQLite is never written back to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    length, voices = _fraction_voices(measure)
+    voice = next((v for v in voices if v["name"] == payload.voice), None)
+    if voice is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "voice not found in measure",
+                "voice": payload.voice,
+            },
+        )
+
+    tolerance = parse_nonnegative_rational(payload.tolerance)
+    hits = [parse_nonnegative_rational(raw) for raw in payload.hits]
+    for index, offset in enumerate(hits):
+        if offset >= length:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "invalid hit offsets; nothing was saved",
+                    "reason": f"hit {index} offset {format_rational(offset)} "
+                    "must be smaller than the measure target duration "
+                    f"{format_rational(length)}",
+                    "target_duration": format_rational(length),
+                },
+            )
+        if index > 0 and offset <= hits[index - 1]:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "invalid hit offsets; nothing was saved",
+                    "reason": f"hit {index} offset {format_rational(offset)} "
+                    "must be strictly greater than the previous hit offset "
+                    f"{format_rational(hits[index - 1])}",
+                    "target_duration": format_rational(length),
+                },
+            )
+
+    result = performance_audit(voice, hits, tolerance)
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "voice": payload.voice,
+        "tolerance": format_rational(tolerance),
+        "pairs": [
+            {
+                "event_id": pair["event"]["id"],
+                "hit_index": pair["hit_index"],
+                "difference": format_rational(pair["difference"]),
+            }
+            for pair in result["pairs"]
+        ],
+        "missed": [event["id"] for event in result["missed"]],
+        "extra": result["extra"],
+        "total_abs_difference": format_rational(result["total_abs_difference"]),
     }

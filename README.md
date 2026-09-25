@@ -673,6 +673,83 @@ curl -s -X POST http://localhost:8000/measures/1/rehearsal-chunks-preview \
 }
 ```
 
+### `POST /measures/{id}/performance-audit` — 实演击打诊断（只读，不写库）
+
+把一次实际演奏的击打与已保存小节中**一个声部**的应有击打做对齐诊断。请求体：
+
+| 字段        | 说明                                                                 |
+| ----------- | -------------------------------------------------------------------- |
+| `voice`     | 该小节中一个声部的名字（1～100 字符）                                |
+| `hits`      | 实际击打偏移列表：每项为**非负有理数字符串**（格式同时长，允许 `"0"`），必须**严格递增**且都落在 `[0, 目标时长)` 内；允许空列表 |
+| `tolerance` | 容差（**非负有理数字符串**，允许 `"0"`）：只允许时差绝对值不超过它的配对 |
+
+该声部每个 **sound 事件的起点**即一个预期击打（休止事件不产生预期击打）。服务把预期击打
+与实际击打**按顺序一对一**对齐（配对保持双方先后顺序，不能交叉），在所有合法配对中依次
+按以下优先级择优：
+
+1. **漏击与多击总数最少**（漏击 = 未配对的预期击打，多击 = 未配对的实际击打；等价于配对数最多）；
+2. **配对时差绝对值之和最小**；
+3. 前两项都相同时，取**配对索引序列字典序最小**者（按对齐顺序比较每对的
+   （事件序号, 实际击打序号））。
+
+全部运算使用 `fractions.Fraction` 精确完成。
+
+- 响应字段：`pairs` 按对齐顺序列出每对的 `event_id`（事件 ID，与 `GET /measures/{id}`
+  一致）、`hit_index`（**0 起**的实际击打列表下标）与 `difference`（**有符号**时差 =
+  实际击打 − 预期起点，精确分数）；`missed` 为漏击事件 ID（按声部内顺序）；`extra` 为
+  多击的实际击打下标（0 起，升序）；`total_abs_difference` 为配对时差绝对值之和
+  （第二优化目标的最小值）。
+- 小节 ID 不存在返回 **404**；声部名不在该小节中返回 **422**；击打偏移非法（格式错误、
+  未严格递增、超出 `[0, 目标时长)`）或容差格式非法返回 **422**。
+- 该接口为**只读诊断，不写入数据库**，已保存小节保持不变。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/performance-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"voice": "melody", "hits": ["1/16", "1/2", "5/8"], "tolerance": "1/8"}'
+```
+
+例：小节时长 `1`，`melody` 的 sound 事件起点为 `0`（`v1e1`）与 `3/4`（`v1e3`）。容差
+`1/8` 下，`1/16` 比对 `0` 晚 `1/16`，`5/8` 比对 `3/4` 早 `1/8`，而 `1/2` 距两个起点
+都超过容差，成为多击：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "voice": "melody",
+  "tolerance": "1/8",
+  "pairs": [
+    {"event_id": "v1e1", "hit_index": 0, "difference": "1/16"},
+    {"event_id": "v1e3", "hit_index": 2, "difference": "-1/8"}
+  ],
+  "missed": [],
+  "extra": [1],
+  "total_abs_difference": "3/16"
+}
+```
+
+声部不存在与击打偏移非法时的响应示例：
+
+```json
+{
+  "detail": {
+    "message": "voice not found in measure",
+    "voice": "drums"
+  }
+}
+```
+
+```json
+{
+  "detail": {
+    "message": "invalid hit offsets; nothing was saved",
+    "reason": "hit 2 offset 1/2 must be strictly greater than the previous hit offset 1/2",
+    "target_duration": "1"
+  }
+}
+```
+
 > 在浏览器中打开 http://localhost:8000/ 可查看服务与接口清单，
 > http://localhost:8000/docs 为可直接发起请求的 Swagger UI。
 
@@ -689,7 +766,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览、排练双轨分组（冲突图二染色 + 负载均衡）、排练分段（边界切点上的最少段数/最少截断动态规划，纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览、排练双轨分组（冲突图二染色 + 负载均衡）、排练分段（边界切点上的最少段数/最少截断动态规划）、实演击打诊断（预期/实际击打的保序最优配对动态规划，纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

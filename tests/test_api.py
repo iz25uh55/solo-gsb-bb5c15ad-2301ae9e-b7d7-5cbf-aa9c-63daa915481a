@@ -1303,3 +1303,194 @@ def test_rehearsal_chunks_preview_is_read_only():
     )
     assert response.status_code == 200
     assert client.get(f"/measures/{measure_id}").json() == before
+
+
+# --- POST /measures/{id}/performance-audit ----------------------------------
+
+# VALID_PAYLOAD melody onsets: v1e1 at 0, v1e3 at 3/4 (v1e2 is a rest).
+def test_performance_audit_aligns_hits_and_reports_misses_and_extras():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "melody", "hits": ["1/16", "1/2", "5/8"], "tolerance": "1/8"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["voice"] == "melody"
+    assert body["tolerance"] == "1/8"
+    # 1/16 is 1/16 late for onset 0; 5/8 is 1/8 early for onset 3/4; the
+    # hit at 1/2 pairs with nothing within 1/8.
+    assert body["pairs"] == [
+        {"event_id": "v1e1", "hit_index": 0, "difference": "1/16"},
+        {"event_id": "v1e3", "hit_index": 2, "difference": "-1/8"},
+    ]
+    assert body["missed"] == []
+    assert body["extra"] == [1]
+    assert body["total_abs_difference"] == "3/16"
+
+
+def test_performance_audit_reports_missed_onsets_and_extra_hits():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "melody", "hits": ["0", "1/2"], "tolerance": "1/8"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pairs"] == [
+        {"event_id": "v1e1", "hit_index": 0, "difference": "0"}
+    ]
+    assert body["missed"] == ["v1e3"]
+    assert body["extra"] == [1]
+    assert body["total_abs_difference"] == "0"
+
+
+def test_performance_audit_minimizes_missed_plus_extra_before_cost():
+    # Onsets 0 and 1/2; hits 0 and 1/4; tolerance 1/4. Pairing both
+    # costs 1/4, pairing only the exact hit costs 0 but leaves one miss
+    # and one extra: the two-pair alignment wins.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/2"},
+            ]},
+            {"name": "b", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "a", "hits": ["0", "1/4"], "tolerance": "1/4"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pairs"] == [
+        {"event_id": "v1e1", "hit_index": 0, "difference": "0"},
+        {"event_id": "v1e2", "hit_index": 1, "difference": "-1/4"},
+    ]
+    assert body["missed"] == []
+    assert body["extra"] == []
+    assert body["total_abs_difference"] == "1/4"
+
+
+def test_performance_audit_ties_break_by_smallest_index_sequence():
+    # One onset 1/4; hits 0 and 1/2 both pair at cost 1/4: the smaller
+    # hit index wins, and hit 1 becomes the extra.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "rest", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+            {"name": "b", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "a", "hits": ["0", "1/2"], "tolerance": "1/4"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pairs"] == [
+        {"event_id": "v1e2", "hit_index": 0, "difference": "-1/4"}
+    ]
+    assert body["missed"] == []
+    assert body["extra"] == [1]
+
+
+def test_performance_audit_404_for_missing_measure():
+    response = client.post(
+        "/measures/999999/performance-audit",
+        json={"voice": "melody", "hits": ["0"], "tolerance": "1/8"},
+    )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "measure not found"}
+
+
+def test_performance_audit_422_for_unknown_voice():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "drums", "hits": ["0"], "tolerance": "1/8"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["voice"] == "drums"
+
+
+def test_performance_audit_rejects_invalid_hit_offsets():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # Not strictly increasing (equal or decreasing offsets).
+    for hits in (["1/2", "1/2"], ["1/2", "1/4"], ["1/4", "1/4", "1/2"]):
+        response = client.post(
+            f"/measures/{measure_id}/performance-audit",
+            json={"voice": "melody", "hits": hits, "tolerance": "1/8"},
+        )
+        assert response.status_code == 422, hits
+        assert "reason" in response.json()["detail"]
+    # Offsets must lie in [0, target): the target itself is rejected.
+    for hits in (["1"], ["0", "1"], ["5/4"]):
+        response = client.post(
+            f"/measures/{measure_id}/performance-audit",
+            json={"voice": "melody", "hits": hits, "tolerance": "1/8"},
+        )
+        assert response.status_code == 422, hits
+        assert "reason" in response.json()["detail"]
+
+
+def test_performance_audit_validates_payload():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # Each hit must be a non-negative rational string.
+    for bad_hit in ("-1/2", "abc", "1.5", "1/0"):
+        response = client.post(
+            f"/measures/{measure_id}/performance-audit",
+            json={"voice": "melody", "hits": [bad_hit], "tolerance": "1/8"},
+        )
+        assert response.status_code == 422, bad_hit
+    # tolerance must be a non-negative rational string ("0" is fine).
+    for bad_tolerance in ("-1/8", "abc", "1.5", "1/0"):
+        response = client.post(
+            f"/measures/{measure_id}/performance-audit",
+            json={"voice": "melody", "hits": ["0"], "tolerance": bad_tolerance},
+        )
+        assert response.status_code == 422, bad_tolerance
+    response = client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "melody", "hits": ["0"], "tolerance": "0"},
+    )
+    assert response.status_code == 200, response.text
+    # An empty hits list is valid: every onset is missed.
+    response = client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "melody", "hits": [], "tolerance": "1/8"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pairs"] == []
+    assert body["missed"] == ["v1e1", "v1e3"]
+    assert body["extra"] == []
+    # Missing body / fields are request-validation errors too.
+    assert client.post(
+        f"/measures/{measure_id}/performance-audit", json={}
+    ).status_code == 422
+    assert client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "melody", "hits": ["0"]},
+    ).status_code == 422
+
+
+def test_performance_audit_is_read_only():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(
+        f"/measures/{measure_id}/performance-audit",
+        json={"voice": "melody", "hits": ["0", "3/4"], "tolerance": "0"},
+    )
+    assert response.status_code == 200
+    assert client.get(f"/measures/{measure_id}").json() == before
