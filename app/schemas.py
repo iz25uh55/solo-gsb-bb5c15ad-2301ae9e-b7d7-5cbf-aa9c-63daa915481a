@@ -396,3 +396,50 @@ class RehearsalChunksPreviewOut(BaseModel):
     truncated_event_count: int
     chunks: list[RehearsalChunkOut]
     cuts: list[RehearsalCutOut]
+
+
+class PerformanceAuditIn(BaseModel):
+    """One voice's actual hit offsets plus the pairing tolerance.
+
+    ``offsets`` are the actual played hit offsets: non-negative rational
+    strings, strictly increasing, each inside [0, target duration).
+    ``tolerance`` is a non-negative rational string: an expected onset
+    and an actual hit may pair only within this absolute difference.
+    """
+
+    voice: str = Field(min_length=1, max_length=100, examples=["melody"])
+    offsets: list[str] = Field(examples=[["1/16", "5/8", "7/8"]])
+    tolerance: str = Field(examples=["1/8"])
+
+    @field_validator("tolerance")
+    @classmethod
+    def tolerance_must_be_nonnegative_rational(cls, value: str) -> str:
+        try:
+            parse_nonnegative_rational(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+
+class PerformanceAuditPairOut(BaseModel):
+    """One expected/actual pairing: event id, hit index, signed difference."""
+
+    event_id: str
+    # 0-based index into the request's offsets list.
+    hit_index: int
+    # actual offset - expected onset (may be negative).
+    diff: str
+
+
+class PerformanceAuditOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    voice: str
+    tolerance: str
+    pairs: list[PerformanceAuditPairOut]
+    # Sound events left unpaired (missed hits), in voice event order.
+    missed: list[str]
+    # 0-based indices of actual hits left unpaired (extra hits), ascending.
+    extra: list[int]
+    # Sum of |diff| over all pairs (the minimized secondary objective).
+    total_abs_diff: str

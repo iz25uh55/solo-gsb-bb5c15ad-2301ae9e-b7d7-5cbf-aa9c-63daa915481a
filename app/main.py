@@ -72,6 +72,18 @@ cut, then the time-lexicographically earliest cut sequence. When no
 such partition exists (a boundary gap already exceeds the cap) the
 request is rejected with 422. It is a read-only preview; nothing is
 written back to SQLite.
+
+A saved voice's sound onsets can also be audited against actually
+played hits (POST /measures/{id}/performance-audit): the request names
+one voice, a strictly increasing list of actual hit offsets inside
+[0, target duration), and a non-negative rational tolerance. Every
+sound event start is an expected hit; expected and actual hits are
+aligned in order, one-to-one, pairing only when the absolute difference
+stays within tolerance. The alignment first minimizes the total of
+missed plus extra hits, then the sum of absolute paired differences,
+and ties are broken by the lexicographically smallest paired hit-index
+sequence. It is a read-only diagnostic; nothing is written back to
+SQLite.
 """
 
 from __future__ import annotations
@@ -86,6 +98,7 @@ from .grid import (
     MAX_EXPANDED_EVENTS,
     MAX_PRACTICE_TRACK_VOICES,
     LoopAlignmentTooLarge,
+    PerformanceAuditOffsetsInvalid,
     PracticeTracksInfeasible,
     QuantizationInfeasible,
     RehearsalChunksInfeasible,
@@ -100,8 +113,10 @@ from .grid import (
     format_rational,
     format_seconds,
     lead_handoff_preview,
+    parse_hit_offsets,
     parse_nonnegative_rational,
     parse_rational,
+    performance_audit,
     practice_track_split,
     quantize_measure,
     rehearsal_chunks_preview,
@@ -117,6 +132,8 @@ from .schemas import (
     MeasureIn,
     MeasureOut,
     Mismatch,
+    PerformanceAuditIn,
+    PerformanceAuditOut,
     PracticeTracksOut,
     QuantizationPreviewIn,
     QuantizationPreviewOut,
@@ -160,6 +177,7 @@ def root() -> dict:
             "lead_handoff_preview": "POST /measures/{id}/lead-handoff-preview",
             "practice_tracks": "POST /measures/{id}/practice-tracks",
             "rehearsal_chunks_preview": "POST /measures/{id}/rehearsal-chunks-preview",
+            "performance_audit": "POST /measures/{id}/performance-audit",
         },
     }
 
@@ -690,4 +708,59 @@ def rehearsal_chunks_preview_route(
             }
             for cut in result["cuts"]
         ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/performance-audit",
+    response_model=PerformanceAuditOut,
+)
+def performance_audit_route(measure_id: int, payload: PerformanceAuditIn) -> dict:
+    # Read-only: the hit alignment is computed from the stored measure in
+    # exact fractions, but SQLite is never written back to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    length, voices = _fraction_voices(measure)
+    voice = next((v for v in voices if v["name"] == payload.voice), None)
+    if voice is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "voice not found in measure",
+                "voice": payload.voice,
+            },
+        )
+
+    try:
+        offsets = parse_hit_offsets(payload.offsets, length)
+    except PerformanceAuditOffsetsInvalid as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "invalid hit offsets; nothing was saved",
+                "reason": exc.reason,
+                "target_duration": format_rational(length),
+            },
+        ) from exc
+
+    tolerance = parse_nonnegative_rational(payload.tolerance)
+    result = performance_audit(voice["events"], offsets, tolerance)
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "voice": payload.voice,
+        "tolerance": format_rational(tolerance),
+        "pairs": [
+            {
+                "event_id": pair["event"]["id"],
+                "hit_index": pair["hit_index"],
+                "diff": format_rational(pair["diff"]),
+            }
+            for pair in result["pairs"]
+        ],
+        "missed": [event["id"] for event in result["missed"]],
+        "extra": result["extra"],
+        "total_abs_diff": format_rational(result["total_abs_diff"]),
     }

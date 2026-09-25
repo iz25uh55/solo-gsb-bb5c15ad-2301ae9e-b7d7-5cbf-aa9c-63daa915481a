@@ -8,6 +8,7 @@ from app.grid import (
     KIND_REST,
     KIND_SOUND,
     LoopAlignmentTooLarge,
+    PerformanceAuditOffsetsInvalid,
     PracticeTracksInfeasible,
     QuantizationInfeasible,
     RehearsalChunksInfeasible,
@@ -23,9 +24,11 @@ from app.grid import (
     format_rational,
     format_seconds,
     lead_handoff_preview,
+    parse_hit_offsets,
     parse_nonnegative_rational,
     parse_positive_decimal,
     parse_rational,
+    performance_audit,
     practice_track_split,
     quantize_measure,
     rational_lcm,
@@ -1498,6 +1501,123 @@ class RehearsalChunksPreviewTest(unittest.TestCase):
             rehearsal_chunks_preview(voices, Fraction(1, 3))
         self.assertEqual(ctx.exception.start, Fraction(0))
         self.assertEqual(ctx.exception.end, Fraction(1, 2))
+
+
+class PerformanceAuditTest(unittest.TestCase):
+    def voice_events(self, events):
+        return make_voices([("v", events)])[0]["events"]
+
+    def test_parse_hit_offsets_validates_format_order_and_range(self):
+        self.assertEqual(
+            parse_hit_offsets(["0", "1/4", "1/2"], Fraction(1)),
+            [Fraction(0), Fraction(1, 4), Fraction(1, 2)],
+        )
+        self.assertEqual(parse_hit_offsets([], Fraction(1)), [])
+        for bad in (
+            ["1/2", "1/4"],  # decreasing
+            ["1/4", "1/4"],  # not strictly increasing
+            ["1"],           # at the target duration (outside [0, 1))
+            ["3/2"],         # beyond the target duration
+            ["abc"],         # malformed
+            ["-1/4"],        # negative
+            ["0.5"],         # decimal
+            ["1/0"],         # zero denominator
+        ):
+            with self.assertRaises(PerformanceAuditOffsetsInvalid, msg=bad):
+                parse_hit_offsets(bad, Fraction(1))
+
+    def test_perfect_alignment_has_zero_diffs(self):
+        events = self.voice_events(
+            [(KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4")]
+        )
+        result = performance_audit(
+            events, [Fraction(0), Fraction(3, 4)], Fraction(0)
+        )
+        self.assertEqual(
+            [(p["event"]["id"], p["hit_index"], p["diff"]) for p in result["pairs"]],
+            [("v1e1", 0, Fraction(0)), ("v1e3", 1, Fraction(0))],
+        )
+        self.assertEqual(result["missed"], [])
+        self.assertEqual(result["extra"], [])
+        self.assertEqual(result["total_abs_diff"], Fraction(0))
+
+    def test_missed_events_and_extra_hits_are_reported(self):
+        # Onsets 0 and 3/4; the only hit 1/2 is outside tolerance 1/16.
+        events = self.voice_events(
+            [(KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4")]
+        )
+        result = performance_audit(events, [Fraction(1, 2)], Fraction(1, 16))
+        self.assertEqual(result["pairs"], [])
+        self.assertEqual([e["id"] for e in result["missed"]], ["v1e1", "v1e3"])
+        self.assertEqual(result["extra"], [0])
+        self.assertEqual(result["total_abs_diff"], Fraction(0))
+
+    def test_pair_count_is_the_primary_objective(self):
+        # Onsets 0 and 1/2; hits 0 and 9/16 with tolerance 1/16: two
+        # pairs costing 1/16 beat any single zero-cost pair.
+        events = self.voice_events([(KIND_SOUND, "1/2"), (KIND_SOUND, "1/2")])
+        result = performance_audit(
+            events, [Fraction(0), Fraction(9, 16)], Fraction(1, 16)
+        )
+        self.assertEqual(
+            [(p["event"]["id"], p["hit_index"]) for p in result["pairs"]],
+            [("v1e1", 0), ("v1e2", 1)],
+        )
+        self.assertEqual(result["missed"], [])
+        self.assertEqual(result["extra"], [])
+        self.assertEqual(result["total_abs_diff"], Fraction(1, 16))
+
+    def test_cost_tie_breaks_by_lexicographically_smallest_hit_sequence(self):
+        # Onsets 0 and 3/4; hits 1/16, 5/8, 7/8; tolerance 1/8. Pairing
+        # 3/4 with 5/8 or with 7/8 costs the same 1/8; the hit sequence
+        # (0, 1) beats (0, 2), so 7/8 (index 2) is the extra hit.
+        events = self.voice_events(
+            [(KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4")]
+        )
+        result = performance_audit(
+            events,
+            [Fraction(1, 16), Fraction(5, 8), Fraction(7, 8)],
+            Fraction(1, 8),
+        )
+        self.assertEqual(
+            [(p["event"]["id"], p["hit_index"], p["diff"]) for p in result["pairs"]],
+            [("v1e1", 0, Fraction(1, 16)), ("v1e3", 1, Fraction(-1, 8))],
+        )
+        self.assertEqual(result["missed"], [])
+        self.assertEqual(result["extra"], [2])
+        self.assertEqual(result["total_abs_diff"], Fraction(3, 16))
+
+    def test_pairs_may_not_cross(self):
+        # Onsets 0 and 1/4; hits 1/8 and 3/8; tolerance 1/8. Both onsets
+        # could reach hit 0, but the one-to-one in-order alignment pairs
+        # 0 -> 1/8 and 1/4 -> 3/8 (the crossing 0 -> 3/8, 1/4 -> 1/8 is
+        # both out of tolerance and out of order).
+        events = self.voice_events(
+            [(KIND_SOUND, "1/4"), (KIND_SOUND, "3/4")]
+        )
+        result = performance_audit(
+            events, [Fraction(1, 8), Fraction(3, 8)], Fraction(1, 8)
+        )
+        self.assertEqual(
+            [(p["event"]["id"], p["hit_index"], p["diff"]) for p in result["pairs"]],
+            [("v1e1", 0, Fraction(1, 8)), ("v1e2", 1, Fraction(1, 8))],
+        )
+        self.assertEqual(result["total_abs_diff"], Fraction(1, 4))
+
+    def test_rest_only_voice_has_no_expected_hits(self):
+        events = self.voice_events([(KIND_REST, "1")])
+        result = performance_audit(events, [Fraction(1, 4)], Fraction(1, 8))
+        self.assertEqual(result["pairs"], [])
+        self.assertEqual(result["missed"], [])
+        self.assertEqual(result["extra"], [0])
+
+    def test_empty_offsets_miss_every_sound_event(self):
+        events = self.voice_events([(KIND_SOUND, "1/2"), (KIND_REST, "1/2")])
+        result = performance_audit(events, [], Fraction(1, 8))
+        self.assertEqual(result["pairs"], [])
+        self.assertEqual([e["id"] for e in result["missed"]], ["v1e1"])
+        self.assertEqual(result["extra"], [])
+        self.assertEqual(result["total_abs_diff"], Fraction(0))
 
 
 if __name__ == "__main__":

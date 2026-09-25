@@ -1464,3 +1464,157 @@ def rehearsal_chunks_preview(voices: list[dict], max_duration: Fraction) -> dict
         "cuts": cuts,
         "truncated_event_total": sum(cut_cost[index] for index in chosen),
     }
+
+
+# --- Performance audit: aligning played hits with expected sound onsets -----
+
+class PerformanceAuditOffsetsInvalid(ValueError):
+    """Actual hit offsets fail the format/ordering/range requirements."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"invalid hit offsets: {reason}")
+        self.reason = reason
+
+
+def parse_hit_offsets(raw_offsets: list[str], length: Fraction) -> list[Fraction]:
+    """Parse and validate actual hit offsets against the measure length.
+
+    ``raw_offsets`` items must be non-negative rational strings, the list
+    must be strictly increasing, and every offset must lie in
+    [0, ``length``) — a hit at or beyond the target duration falls outside
+    the measure. Returns the offsets as exact Fractions. Raises
+    PerformanceAuditOffsetsInvalid on any violation.
+    """
+    offsets = []
+    previous: Fraction | None = None
+    for index, raw in enumerate(raw_offsets):
+        try:
+            offset = parse_nonnegative_rational(raw)
+        except ValueError as exc:
+            raise PerformanceAuditOffsetsInvalid(f"offset {index}: {exc}") from exc
+        if offset >= length:
+            raise PerformanceAuditOffsetsInvalid(
+                f"offset {index} {format_rational(offset)} must be smaller "
+                "than the measure target duration "
+                f"{format_rational(length)}"
+            )
+        if previous is not None and offset <= previous:
+            raise PerformanceAuditOffsetsInvalid(
+                f"offset {index} {format_rational(offset)} must be greater "
+                f"than the previous offset {format_rational(previous)}"
+            )
+        offsets.append(offset)
+        previous = offset
+    return offsets
+
+
+def _audit_value_better(candidate: tuple, current: tuple) -> bool:
+    """Rank audit values: more pairs, then cheaper, then lex-smaller hit sequence."""
+    if candidate[0] != current[0]:
+        return candidate[0] > current[0]
+    if candidate[1] != current[1]:
+        return candidate[1] < current[1]
+    return candidate[2] < current[2]
+
+
+def performance_audit(
+    events: list[dict], offsets: list[Fraction], tolerance: Fraction
+) -> dict:
+    """Align actual hit offsets with a voice's expected sound onsets.
+
+    ``events`` are one voice's built events (exact Fraction starts); every
+    sound event's start is one expected hit, rests never expect a hit.
+    ``offsets`` are the actual played hit offsets (strictly increasing,
+    inside [0, target duration)). Expected hit i may pair with actual hit
+    j only when |offsets[j] - start_i| <= ``tolerance``; pairings are
+    one-to-one and order-preserving (pairs may not cross).
+
+    The alignment is chosen by, in order:
+
+    1. the minimum total of missed events plus extra hits (equivalently
+       the maximum number of pairs);
+    2. the minimum sum of absolute paired differences;
+    3. the lexicographically smallest sequence of paired hit indices.
+
+    Returns {"pairs": [{"event", "hit_index", "diff}], "missed": [events],
+    "extra": [int], "total_abs_diff": Fraction}; diff = actual - expected
+    (signed).
+
+    Optimization: a suffix DP over (expected, actual) positions; each cell
+    keeps the best (pair_count, cost, hit-index tuple) reachable from
+    there under the ranking above. The alignment is then rebuilt from the
+    stored values, preferring to pair the earlier event whenever distinct
+    choices tie on the full value.
+    """
+    expected = [event for event in events if event["kind"] == KIND_SOUND]
+    count_expected = len(expected)
+    count_hits = len(offsets)
+
+    zero = (0, Fraction(0), ())
+    # values[i][j]: best (pairs, cost, hit-index tuple) aligning
+    # expected[i:] with offsets[j:].
+    values: list[list[tuple]] = [
+        [zero] * (count_hits + 1) for _ in range(count_expected + 1)
+    ]
+    for i in range(count_expected - 1, -1, -1):
+        start = expected[i]["start"]
+        row = values[i]
+        following = values[i + 1]
+        for j in range(count_hits - 1, -1, -1):
+            best = following[j]  # event i stays unpaired (missed)
+            skip_hit = row[j + 1]  # hit j stays unpaired (extra)
+            if _audit_value_better(skip_hit, best):
+                best = skip_hit
+            diff = offsets[j] - start
+            if -tolerance <= diff <= tolerance:
+                nxt = following[j + 1]
+                paired = (
+                    nxt[0] + 1,
+                    nxt[1] + (diff if diff >= 0 else -diff),
+                    (j,) + nxt[2],
+                )
+                if _audit_value_better(paired, best):
+                    best = paired
+            row[j] = best
+
+    # Rebuild one optimal alignment. On exact value ties prefer pairing
+    # (the earlier expected event gets matched), then dropping the hit,
+    # then dropping the event; every such choice is optimal by the stored
+    # values, so the result is deterministic.
+    pairs = []
+    missed = []
+    extra = []
+    i = j = 0
+    while i < count_expected and j < count_hits:
+        target = values[i][j]
+        diff = offsets[j] - expected[i]["start"]
+        if -tolerance <= diff <= tolerance:
+            nxt = values[i + 1][j + 1]
+            paired = (
+                nxt[0] + 1,
+                nxt[1] + (diff if diff >= 0 else -diff),
+                (j,) + nxt[2],
+            )
+            if paired == target:
+                pairs.append(
+                    {"event": expected[i], "hit_index": j, "diff": diff}
+                )
+                i += 1
+                j += 1
+                continue
+        if values[i][j + 1] == target:  # hit j is an extra hit
+            extra.append(j)
+            j += 1
+            continue
+        # Event i is missed (its value equals the target by construction).
+        missed.append(expected[i])
+        i += 1
+    missed.extend(expected[i:])
+    extra.extend(range(j, count_hits))
+
+    return {
+        "pairs": pairs,
+        "missed": missed,
+        "extra": extra,
+        "total_abs_diff": values[0][0][1],
+    }
